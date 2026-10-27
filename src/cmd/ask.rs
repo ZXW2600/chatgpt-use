@@ -47,6 +47,8 @@ pub struct AskInput {
     pub prompt: String,
     /// Context file paths, read by [`execute`].
     pub files: Vec<String>,
+    /// Paths of files to UPLOAD as real attachments, read by [`execute`].
+    pub attach: Vec<String>,
     /// Context text already in hand (the CLI's stdin, an MCP argument).
     pub context: Option<String>,
     /// Ask for JSON matching this schema and validate it.
@@ -106,6 +108,7 @@ pub fn run(args: &AskArgs) -> Result<()> {
             let input = AskInput {
                 prompt: args.prompt.clone(),
                 files: args.files.clone(),
+                attach: args.attach.clone(),
                 context: match read {
                     StdinRead::Text(t) => Some(t),
                     _ => None,
@@ -159,6 +162,12 @@ pub fn execute(input: &AskInput, mut opts: ChannelOptions) -> Value {
         Ok(m) => m,
         Err(e) => return tag(structured::failure(&e), input),
     };
+    // Read attachment bytes BEFORE the receipt is claimed: an unreadable file
+    // fails the whole ask without touching the browser, exactly like --file.
+    let attachments = match load_attachments(&input.attach) {
+        Ok(a) => a,
+        Err(e) => return tag(structured::failure(&e), input),
+    };
     match claim_receipt(input.request_id.as_deref(), input.owner, input.owner_token.as_deref()) {
         Ok(path) => opts.receipt = path,
         Err(e) => return tag(structured::failure(&e), input),
@@ -169,8 +178,9 @@ pub fn execute(input: &AskInput, mut opts: ChannelOptions) -> Value {
     };
 
     let mut convo = None;
+    let sopts = crate::channel::SendOptions { attachments, ..Default::default() };
     let reply = Channel::connect(&opts).and_then(|mut channel| {
-        let reply = channel.send(&message);
+        let reply = channel.send_with(&message, &sopts);
         convo = channel.conversation_id().map(str::to_string);
         channel.close();
         reply
@@ -196,6 +206,25 @@ pub fn execute(input: &AskInput, mut opts: ChannelOptions) -> Value {
         }),
     );
     tag(envelope, input)
+}
+
+/// Read the files named for upload into memory.
+///
+/// Bytes, not paths: the composer is filled over `chrome-use eval`, so handing
+/// the page a path would let it read files this turn never meant to share.
+/// Anything unreadable fails the ask before the browser is touched.
+fn load_attachments(paths: &[String]) -> Result<Vec<crate::channel::Attachment>> {
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let data = fs::read(path)
+            .with_context(|| format!("failed to read attachment: {path}"))?;
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+        out.push(crate::channel::Attachment { filename, mime: None, data });
+    }
+    Ok(out)
 }
 
 /// Stamp the caller's request id on an envelope.
@@ -565,6 +594,7 @@ mod tests {
         AskInput {
             prompt: prompt.into(),
             files: vec![],
+            attach: vec![],
             context: None,
             schema: None,
             request_id: None,

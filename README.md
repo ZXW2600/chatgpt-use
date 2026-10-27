@@ -70,6 +70,26 @@ git diff | chatgpt-use ask "Explain what changed and what might break"
   (`relay` → logged-in profile), composer polling, rate-limit-dialog detection, in-page
   authenticated `fetch`, and conversation filing under a ChatGPT **Project**.
 
+#### Real file attachments — `ask --attach`
+
+`--file` pastes a file's TEXT into the message. `--attach` UPLOADS it instead, through ChatGPT's own
+upload pipeline, by handing the bytes to the composer's hidden `input[type=file]` — the same path a
+drag-and-drop takes. ChatGPT runs its authenticated upload itself; this tool never sees its token.
+
+```bash
+chatgpt-use ask "Summarise this datasheet and flag the thermal limits" --attach spec.pdf
+chatgpt-use ask "What changed between these two boards?" --attach rev_a.png --attach rev_b.png
+```
+
+Use it when the STRUCTURE matters — PDF layout, spreadsheet cells, image pixels, a sealed archive —
+because text inlining flattens all of that and spends the prompt budget on bytes ChatGPT could have
+parsed for free. `--file` stays the right choice for plain source text you want in the prompt.
+
+Fails closed: every file must settle as an attachment chip before the message is sent, so a turn
+never goes out short-handed. At most 10 files per message (ChatGPT's own composer limit). The bytes
+are read locally and rebuilt inside the page — a path is never handed to the browser, so an
+attachment can never make the page read a file this turn did not name.
+
 #### Structured output — `ask --output-schema`
 
 For a caller that parses the answer (a PR-review service, a CI step), pass a JSON Schema. The
@@ -571,7 +591,7 @@ chatgpt-use work "<task>"
 chatgpt-use refresh [--connector chatgpt-use] [--url <settings-url>]
 
 # Sidekick — plain question (harness is the brain)
-chatgpt-use ask "<question>" [--file <path> ...] [--profile auto|relay|"Profile N"]
+chatgpt-use ask "<question>" [--file <path> ...] [--attach <path> ...] [--profile auto|relay|"Profile N"]
 
 # Structured delegation — ChatGPT plans/reviews, returns a verdict packet
 chatgpt-use ask "<task>" --mode plan|review|debug|research --file <ctx> [--json] [--model pro]

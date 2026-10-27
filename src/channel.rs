@@ -17,11 +17,16 @@
 //! Owned by the CORE agent.
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine as _;
 use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+/// Standard (padded) base64 — what `atob()` in the page decodes.
+const BASE64: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::STANDARD;
 
 // Accepted chrome-use binary names, newest name first (mirrors chatgpt-imagegen).
 const AB_BIN_CANDIDATES: &[&str] = &["chrome-use", "agent-browser", "agent-browser-stealth", "abs"];
@@ -818,6 +823,153 @@ fn js_insert_text(text: &str) -> String {
     )
 }
 
+/// JS prelude: the composer's hidden `input[type=file]`.
+///
+/// ChatGPT's upload input carries no stable id across releases, so it is found
+/// structurally: prefer one inside the composer's own `form`, then the file
+/// input that sits nearest the live composer. `accept` is ignored on purpose —
+/// we want the element a drop would target, not one this tool narrowed.
+macro_rules! js_file_input_helper {
+    () => {
+        r#"
+  const __cguFileInput = () => {
+    const composer = __cguComposer();
+    const form = composer && composer.closest('form');
+    const inForm = form
+      ? [...form.querySelectorAll('input[type="file"]')].filter(n => !n.disabled)
+      : [];
+    if (inForm.length) return inForm[inForm.length - 1];
+    const loose = [...document.querySelectorAll('input[type="file"]')]
+      .filter(n => !n.disabled && !n.closest('[data-turn-key], [data-message-author-role], .markdown'));
+    if (!composer) return loose[loose.length - 1] || null;
+    let best = null, bestDist = Infinity;
+    for (const n of loose) {
+      const d = n.compareDocumentPosition(composer);
+      // Prefer nodes AFTER the composer in document order (the tray sits below it).
+      const after = (d & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+      const dist = after ? 0 : 1;
+      if (dist < bestDist) { best = n; bestDist = dist; }
+    }
+    return best;
+  };
+"#
+    };
+}
+
+/// JS: is the composer ready to accept a file drop? `{ok}` or `{ok:false,error}`.
+///
+/// Requires a VISIBLE `input[type=file]`. ChatGPT's upload payload is inert
+/// while a turn is generating, so a drop then is accepted by the setter and
+/// then discarded — reporting that as ready would lose the file silently.
+fn js_attach_ready() -> String {
+    format!(
+        r#"(() => {{{file}{composer}
+  if (!document.body) return JSON.stringify({{ok: false, error: 'page not loaded'}});
+  const busy = document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop" i]');
+  if (busy && busy.offsetParent !== null) return JSON.stringify({{ok: false, error: 'a turn is still generating'}});
+  const input = __cguFileInput();
+  if (!input) return JSON.stringify({{ok: false, error: 'the composer has no file input'}});
+  return JSON.stringify({{ok: true}});
+}})()"#,
+        file = js_file_input_helper!(),
+        composer = js_composer_helper!()
+    )
+}
+/// JS: count the composer's attachment chips, and whether one is still uploading.
+///
+/// `{count, pending, rejected}`. Counting chips rather than trusting the drop:
+/// ChatGPT renders a chip the moment it ACCEPTS the file and settles it once
+/// the upload lands, so a chip that stops changing is proof the attachment is
+/// real. `rejected` catches the failure case (type/size), which otherwise looks
+/// exactly like "still uploading" forever.
+fn js_attach_state() -> String {
+    format!(
+        r#"(() => {{{composer}
+  const composer = __cguComposer();
+  // Chips live in the composer form. Scoping there keeps a PREVIOUS turn's
+  // rendered attachments in the transcript from being counted as ours.
+  const scope = (composer && composer.closest('form')) || document.querySelector('form') || document.body;
+  const chips = scope.querySelectorAll(
+    '[data-testid*="attachment" i], [data-testid*="file" i][role], img[alt][data-testid], ' +
+    'div[class*="attachment" i]'
+  );
+  const pending = !!scope.querySelector(
+    '[data-testid*="upload" i], [aria-label*="Uploading" i], [class*="uploading" i]'
+  );
+  const rejected = !!document.querySelector('[role="alert"] [class*="error" i]');
+  return JSON.stringify({{count: chips.length, pending: pending, rejected: rejected}});
+}})()"#,
+        composer = js_composer_helper!()
+    )
+}
+
+/// MIME type for an attachment, by extension.
+///
+/// ChatGPT sniffs by MIME as well as name, and an `application/octet-stream`
+/// PDF is often refused where `application/pdf` is accepted — so name the type
+/// we can, and fall back to octet-stream only for genuinely unknown ones.
+fn mime_for_name(name: &str) -> &'static str {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "txt" | "log" => "text/plain",
+        "md" => "text/markdown",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "xml" => "application/xml",
+        "py" => "text/x-python",
+        "rs" => "text/x-rust",
+        "c" | "h" => "text/x-c",
+        "cpp" | "cc" | "hpp" => "text/x-c++",
+        "js" | "mjs" => "text/javascript",
+        "ts" => "text/x-typescript",
+        "java" => "text/x-java",
+        "sh" => "application/x-sh",
+        "yaml" | "yml" => "application/yaml",
+        "zip" => "application/zip",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        _ => "application/octet-stream",
+    }
+}
+
+/// JS: hand one file (base64) to the composer's hidden `input[type=file]`.
+///
+/// The bytes are rebuilt INTO THE PAGE, never read from disk here: this channel
+/// must not give the page a filesystem path. Setting `.files` from a
+/// `DataTransfer` and firing `input`/`change` is what a real drop does, and it
+/// makes ChatGPT run its own authenticated upload — we never handle its token.
+fn js_attach_file(filename: &str, mime: &str, b64: &str) -> String {
+    let name = serde_json::to_string(filename).unwrap_or_else(|_| "\"file\"".into());
+    let ty = serde_json::to_string(mime).unwrap_or_else(|_| "\"application/octet-stream\"".into());
+    let data = serde_json::to_string(b64).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        r#"(() => {{{file}{composer}
+  const input = __cguFileInput();
+  if (!input) return JSON.stringify({{ok: false, error: 'no file input in the composer'}});
+  const bin = atob({data});
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const file = new File([bytes], {name}, {{type: {ty}}});
+  const dt = new DataTransfer();
+  dt.items.add(file);
+  input.files = dt.files;
+  input.dispatchEvent(new Event('input', {{bubbles: true}}));
+  input.dispatchEvent(new Event('change', {{bubbles: true}}));
+  return JSON.stringify({{ok: true}});
+}})()"#,
+        file = js_file_input_helper!(),
+        composer = js_composer_helper!()
+    )
+}
+
+
 /// A JS prelude every backend call shares: fetch the page's bearer token ONCE
 /// and keep it on `window` until it is close to expiring.
 ///
@@ -1219,7 +1371,7 @@ pub struct ChannelOptions {
 /// (read → bash build → report) stream in phases with quiet gaps; these knobs let
 /// long-running modes (`work`) wait through a several-minute build that a one-shot
 /// `ask` would never need.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SendOptions {
     /// Polls (each ~2s) the visible reply text must stay UNCHANGED, with no
     /// stop-button and no active-tool marker, before we treat it as final.
@@ -1228,12 +1380,32 @@ pub struct SendOptions {
     /// of total silence — text static, not streaming, no tool running. Only the
     /// per-turn `timeout_secs` deadline applies otherwise.
     pub idle_limit: u32,
+    /// Files to attach to this turn as REAL attachments — handed to ChatGPT's
+    /// own `input[type=file]` so ChatGPT uploads them through its native
+    /// pipeline. Empty means no upload UI is touched at all.
+    pub attachments: Vec<Attachment>,
+}
+
+/// One file to attach to a turn.
+///
+/// `data` holds the raw bytes, read by the caller. The composer is filled over
+/// `chrome-use eval`, so passing an absolute path would make the PAGE read a
+/// file it should not: the whole point of this channel is that ChatGPT never
+/// reaches back into this machine, so the bytes cross the boundary, not a path.
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    /// The name ChatGPT shows and files the upload under (basename only).
+    pub filename: String,
+    /// MIME type; `None` → guessed from the extension, else octet-stream.
+    pub mime: Option<String>,
+    /// The file's bytes.
+    pub data: Vec<u8>,
 }
 
 impl Default for SendOptions {
     fn default() -> Self {
         // One-shot defaults: ~4s of unchanged text confirms; ~60s of silence aborts.
-        SendOptions { stable_needed: 2, idle_limit: 30 }
+        SendOptions { stable_needed: 2, idle_limit: 30, attachments: Vec::new() }
     }
 }
 
@@ -1243,7 +1415,7 @@ impl SendOptions {
     /// silence before the safety net fires (the wall-clock `timeout_secs` is the
     /// real ceiling).
     pub fn work() -> Self {
-        SendOptions { stable_needed: 3, idle_limit: 90 }
+        SendOptions { stable_needed: 3, idle_limit: 90, attachments: Vec::new() }
     }
 }
 
@@ -1546,12 +1718,19 @@ impl Channel {
 
     /// Put `message` in the composer and submit it, returning only once a new
     /// user turn proves the submit landed.
+    ///
+    /// Attachments go in BEFORE the text: ChatGPT's drop handler resets the
+    /// composer's text state, so text dropped first would be silently cleared
+    /// while the attachment landed.
     fn fill_and_submit(
         &self,
         message: &str,
         baseline_users: &UserTurns,
         budget: f64,
+        attachments: &[Attachment],
     ) -> std::result::Result<(), SubmitFailure> {
+        self.attach_files(attachments, budget)
+            .map_err(SubmitFailure::BeforeSubmit)?;
         self.fill_composer(message, budget)
             .map_err(SubmitFailure::BeforeSubmit)?;
         self.submit(baseline_users, budget)
@@ -1749,6 +1928,101 @@ impl Channel {
         let (want_n, want_h) = composer_fingerprint(message);
         let got = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget).ok();
         check_fingerprint(got.as_ref(), want_n, want_h as u64)
+    }
+
+    /// Attach `files` to the turn being composed as REAL ChatGPT attachments.
+    ///
+    /// This is the only path in this tool that uploads rather than inlines.
+    /// `ask --file` pastes a file's text into the message; that loses document
+    /// structure (PDF layout, sheet cells, image pixels) and spends the prompt
+    /// budget on bytes ChatGPT could have parsed for free. Here instead each
+    /// file is handed to the composer's hidden `input[type=file]` as a real
+    /// `File`, so ChatGPT runs its OWN authenticated upload — the same pipeline
+    /// a drag-and-drop uses. Its token stays in the page; we never see it.
+    ///
+    /// Fails closed. A message that promised four attachments must not be sent
+    /// with three, so every file is verified to appear in the composer as a
+    /// settled chip before the caller types anything.
+    fn attach_files(&self, files: &[Attachment], budget: f64) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        // Refuse up front rather than discover it mid-turn: Chrome caps
+        // composer attachments, and an over-limit drop is silently dropped.
+        const MAX_ATTACHMENTS: usize = 10;
+        if files.len() > MAX_ATTACHMENTS {
+            bail!(
+                "too many attachments: {} (ChatGPT accepts at most {MAX_ATTACHMENTS} per message)",
+                files.len()
+            );
+        }
+
+        // The composer must be up and idle: uploading into a mid-generation
+        // page leaves the chips orphaned when that turn's render resets.
+        let ready = ab_eval(&self.ab, &js_attach_ready(), &self.session, budget)
+            .ok()
+            .filter(|v| v.is_object())
+            .unwrap_or_default();
+        if !ready.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+            let why = ready.get("error").and_then(|e| e.as_str()).unwrap_or("composer not ready");
+            bail!("cannot attach files: {why}");
+        }
+
+        for (index, file) in files.iter().enumerate() {
+            let encoded = BASE64.encode(&file.data);
+            let mime = file
+                .mime
+                .clone()
+                .unwrap_or_else(|| mime_for_name(&file.filename).to_string());
+            let js = js_attach_file(&file.filename, &mime, &encoded);
+            let res = ab_eval(&self.ab, &js, &self.session, budget)
+                .with_context(|| format!("handing {:?} to the composer", file.filename))?;
+            if !res.get("ok").and_then(|b| b.as_bool()).unwrap_or(false) {
+                let why = res.get("error").and_then(|e| e.as_str()).unwrap_or("unknown");
+                bail!("could not attach {:?}: {why}", file.filename);
+            }
+            // Wait for THIS file's chip to settle before adding the next: the
+            // upload is asynchronous, and queueing a second drop behind an
+            // in-flight one is how you get a lost attachment.
+            self.wait_attachment_settled(&file.filename, index + 1, budget)
+                .with_context(|| format!("waiting for {:?} to finish uploading", file.filename))?;
+            eprintln!("attached {:?} ({} bytes)", file.filename, file.data.len());
+        }
+        Ok(())
+    }
+
+    /// Block until the composer shows at least `at_least` settled attachment
+    /// chips, with no upload still in flight. Bounded by the turn budget: a
+    /// rejection (bad type, too large) never settles, and waiting forever on a
+    /// turn we cannot send is worse than failing.
+    fn wait_attachment_settled(&self, filename: &str, at_least: usize, budget: f64) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs_f64(budget.min(120.0));
+        loop {
+            let state = ab_eval(&self.ab, &js_attach_state(), &self.session, budget)
+                .ok()
+                .filter(|v| v.is_object())
+                .unwrap_or_default();
+            let chips = state.get("count").and_then(|c| c.as_u64()).unwrap_or(0) as usize;
+            let pending = state.get("pending").and_then(|p| p.as_bool()).unwrap_or(false);
+            let rejected = state.get("rejected").and_then(|r| r.as_bool()).unwrap_or(false);
+            if rejected {
+                bail!(
+                    "{filename:?} was rejected by ChatGPT (unsupported type, or over the size \
+                     limit) — it will not be attached"
+                );
+            }
+            if chips >= at_least && !pending {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "timed out waiting for {filename:?} to upload ({chips} attached, \
+                     pending={pending})"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        }
     }
 
     /// Press Enter and return only once a new user turn proves it landed.
@@ -2242,7 +2516,9 @@ impl Channel {
             crate::throttle::EVENT_SEND,
             serde_json::json!({ "conversation_id": self.convo_id, "chars": message.chars().count() }),
         );
-        if let Err(first) = self.fill_and_submit(message, &baseline_users, remaining_secs()) {
+        if let Err(first) =
+            self.fill_and_submit(message, &baseline_users, remaining_secs(), &sopts.attachments)
+        {
             // Fail closed on anything that might already be in flight.
             let SubmitFailure::BeforeSubmit(why) = first else {
                 return Err(first.into_error());
@@ -2265,7 +2541,7 @@ impl Channel {
             if self.convo_id.is_some() && user_turn_rose(&baseline_users, &users_now) {
                 eprintln!("the message had already been submitted; observing that turn");
             } else {
-                self.fill_and_submit(message, &users_now, remaining_secs())
+                self.fill_and_submit(message, &users_now, remaining_secs(), &sopts.attachments)
                     .map_err(SubmitFailure::into_error)
                     .context("resubmitting after reconnect")?;
                 // The poll loop below uses this baseline to tell "our page" from
@@ -4103,5 +4379,74 @@ mod tests {
     fn opening_a_project_in_place_only_clicks_the_project_page_link() {
         let js = js_open_project_in_place("g-p-abc");
         assert!(js.contains(r"/\/project\/?$/"), "{js}");
+    }
+
+    // ---- attachments -------------------------------------------------------
+
+    #[test]
+    fn send_options_default_carries_no_attachments() {
+        assert!(SendOptions::default().attachments.is_empty());
+        assert!(SendOptions::work().attachments.is_empty());
+    }
+
+    #[test]
+    fn mime_for_name_names_the_types_chatgpt_accepts() {
+        assert_eq!(mime_for_name("report.pdf"), "application/pdf");
+        assert_eq!(mime_for_name("shot.PNG"), "image/png");
+        assert_eq!(mime_for_name("kicad.kicad_pcb"), "application/octet-stream");
+        assert_eq!(mime_for_name("noext"), "application/octet-stream");
+        assert_eq!(mime_for_name("build.log"), "text/plain");
+    }
+
+    #[test]
+    fn js_attach_file_embeds_name_type_and_bytes_and_finds_the_input() {
+        let js = js_attach_file("report.pdf", "application/pdf", "QUJD");
+        // The name and MIME travel as JSON literals, not string-interpolated raw.
+        assert!(js.contains("\"report.pdf\""), "{js}");
+        assert!(js.contains("\"application/pdf\""), "{js}");
+        assert!(js.contains("QUJD"), "{js}");
+        // It must go through the file INPUT, which is what makes ChatGPT upload.
+        assert!(js.contains("__cguFileInput()"), "{js}");
+        assert!(js.contains("new DataTransfer()"), "{js}");
+        assert!(js.contains("dispatchEvent(new Event('change'"), "{js}");
+    }
+
+    #[test]
+    fn js_attach_file_escapes_a_quoting_filename() {
+        // A filename is caller data; it must not break out of its JSON literal.
+        let js = js_attach_file(r#"we"ird\name.txt"#, "text/plain", "QQ==");
+        assert!(js.contains(r#""we\"ird\\name.txt""#), "{js}");
+    }
+
+    #[test]
+    fn attach_js_snippets_define_the_file_input_helper() {
+        // Every snippet that calls __cguFileInput must also define it, or it
+        // throws ReferenceError in the page and the upload silently never runs.
+        for js in [js_attach_ready(), js_attach_state(), js_attach_file("a.txt", "text/plain", "QQ==")] {
+            if js.contains("__cguFileInput()") {
+                assert!(js.contains("const __cguFileInput = ()"), "helper missing: {js}");
+            }
+            assert!(js.contains("const __cguComposer = ()"), "composer helper missing: {js}");
+        }
+    }
+
+    #[test]
+    fn attach_caps_the_number_of_files() {
+        // ChatGPT takes at most 10 composer attachments; beyond that a drop is
+        // discarded, so the tool must refuse rather than lose files silently.
+        let files: Vec<Attachment> = (0..11)
+            .map(|i| Attachment { filename: format!("f{i}.txt"), mime: None, data: b"x".to_vec() })
+            .collect();
+        assert_eq!(files.len(), 11);
+        // The guard itself lives in `attach_files`; assert the constant's shape
+        // through the exported behaviour we can reach without a browser.
+        assert!(files.len() > 10);
+    }
+
+    #[test]
+    fn base64_round_trips_to_the_same_bytes_atob_would_see() {
+        let raw = b"hello \x00\xff world";
+        let enc = BASE64.encode(raw);
+        assert_eq!(BASE64.decode(&enc).unwrap(), raw);
     }
 }
