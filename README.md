@@ -46,14 +46,14 @@ second brain. One round trip, no tool loop.
 
 ```bash
 # one-shot: pipe context in, get an answer back
-chatgpt-use ask "Review this diff for race conditions" --file src/server.rs
+chatgpt-use ask "Review this diff for race conditions" --attach src/server.rs
 
 # or feed it whatever you already gathered
 git diff | chatgpt-use ask "Explain what changed and what might break"
 ```
 
 - The **caller** decides what context to send — `chatgpt-use` just relays it and returns ChatGPT's text.
-- **stdin** is context when it is piped (it goes after any `--file`, before the prompt). By default
+- **stdin** is context when it is piped (it goes after the prompt as inline context). By default
   the first byte (or EOF) must arrive within 5 seconds and EOF within 60, so an agent harness that
   leaves a pipe open cannot hang the run; past either deadline the ask fails as `not_submitted`
   instead of being sent without its context. `--stdin` waits for stdin however long it takes,
@@ -70,20 +70,22 @@ git diff | chatgpt-use ask "Explain what changed and what might break"
   (`relay` → logged-in profile), composer polling, rate-limit-dialog detection, in-page
   authenticated `fetch`, and conversation filing under a ChatGPT **Project**.
 
-#### Real file attachments — `ask --attach`
+#### File attachments — `ask --attach`
 
-`--file` pastes a file's TEXT into the message. `--attach` UPLOADS it instead, through ChatGPT's own
-upload pipeline, by handing the bytes to the composer's hidden `input[type=file]` — the same path a
-drag-and-drop takes. ChatGPT runs its authenticated upload itself; this tool never sees its token.
+Files go to ChatGPT as REAL attachments, uploaded through its own upload pipeline by handing the
+bytes to the composer's hidden `input[type=file]` — the same path a drag-and-drop takes. ChatGPT
+runs its authenticated upload itself; this tool never sees its token.
 
 ```bash
 chatgpt-use ask "Summarise this datasheet and flag the thermal limits" --attach spec.pdf
 chatgpt-use ask "What changed between these two boards?" --attach rev_a.png --attach rev_b.png
 ```
 
-Use it when the STRUCTURE matters — PDF layout, spreadsheet cells, image pixels, a sealed archive —
-because text inlining flattens all of that and spends the prompt budget on bytes ChatGPT could have
-parsed for free. `--file` stays the right choice for plain source text you want in the prompt.
+This is the ONLY way `ask` takes files. That is deliberate: pasting a file's text into the prompt
+flattens everything a document carries — PDF layout, spreadsheet cells, image pixels — refuses
+anything that is not valid UTF-8 (a `.zip`, a firmware image, a binary log), and spends the prompt
+budget on bytes ChatGPT could have parsed for free. Content that genuinely belongs IN the prompt
+still has a way in: pipe it on stdin, or pass the MCP `context` argument.
 
 Fails closed: every file must settle as an attachment chip before the message is sent, so a turn
 never goes out short-handed. At most 10 files per message (ChatGPT's own composer limit). The bytes
@@ -96,7 +98,7 @@ For a caller that parses the answer (a PR-review service, a CI step), pass a JSO
 reply is validated locally, and stdout carries **one JSON line**, whatever happened:
 
 ```bash
-chatgpt-use ask "Review this diff" --file diff.patch --output-schema review.schema.json
+chatgpt-use ask "Review this diff" --attach diff.patch --output-schema review.schema.json
 ```
 
 | `status` | meaning | exit |
@@ -131,7 +133,7 @@ a remote `$ref` is not fetched.
 A caller that might lose track of a request (a timeout, a crash, a kill) should name it:
 
 ```bash
-chatgpt-use ask "Review this diff" --file diff.patch --output-schema review.schema.json \
+chatgpt-use ask "Review this diff" --attach diff.patch --output-schema review.schema.json \
   --request-id pr-42-head-9f3c --busy fail
 chatgpt-use status pr-42-head-9f3c   # never touches the browser
 ```
@@ -591,10 +593,10 @@ chatgpt-use work "<task>"
 chatgpt-use refresh [--connector chatgpt-use] [--url <settings-url>]
 
 # Sidekick — plain question (harness is the brain)
-chatgpt-use ask "<question>" [--file <path> ...] [--attach <path> ...] [--profile auto|relay|"Profile N"]
+chatgpt-use ask "<question>" [--attach <path> ...] [--profile auto|relay|"Profile N"]
 
 # Structured delegation — ChatGPT plans/reviews, returns a verdict packet
-chatgpt-use ask "<task>" --mode plan|review|debug|research --file <ctx> [--json] [--model pro]
+chatgpt-use ask "<task>" --mode plan|review|debug|research --attach <ctx> [--json] [--model pro]
 
 # Hand the packet to a local executor (dry-run unless --execute)
 chatgpt-use ask "<task>" --mode plan --json > plan.json
@@ -758,7 +760,7 @@ cron equivalent: `0 3 * * *  /Users/you/.local/bin/chatgpt-use work "run the tes
 - [x] Mode 3 `serve` — Anthropic-compatible `/v1/messages` shim → Claude Code drop-in — implemented PoC
 - [x] `install.sh` + GitHub-Release workflow
 **Borrowed strengths → the main line (all live-verified unless noted):**
-- [x] **Structured delegation** — `ask --mode plan|review|debug|research` gathers `--file` context, sends a
+- [x] **Structured delegation** — `ask --mode plan|review|debug|research` gathers `--attach` attachments, sends a
   typed machine-delegation packet, parses a strict `verdict: proceed|revise|blocked` packet (fail-fast).
   **Live-verified** (from `codex-chatgpt-bridge`).
 - [x] **Read-only profile (default) + workspace sandbox** — `mcp --profile read-only|full`; paths reject

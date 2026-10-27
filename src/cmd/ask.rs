@@ -45,9 +45,7 @@ const STDIN_TOTAL_WAIT: Duration = Duration::from_secs(60);
 /// One ask, as every front end describes it.
 pub struct AskInput {
     pub prompt: String,
-    /// Context file paths, read by [`execute`].
-    pub files: Vec<String>,
-    /// Paths of files to UPLOAD as real attachments, read by [`execute`].
+    /// Paths of files UPLOADED as real attachments, read by [`execute`].
     pub attach: Vec<String>,
     /// Context text already in hand (the CLI's stdin, an MCP argument).
     pub context: Option<String>,
@@ -107,7 +105,6 @@ pub fn run(args: &AskArgs) -> Result<()> {
         read => {
             let input = AskInput {
                 prompt: args.prompt.clone(),
-                files: args.files.clone(),
                 attach: args.attach.clone(),
                 context: match read {
                     StdinRead::Text(t) => Some(t),
@@ -199,7 +196,7 @@ pub fn execute(input: &AskInput, mut opts: ChannelOptions) -> Value {
         if schema.is_some() { "ask_schema" } else { "ask" },
         serde_json::json!({
             "prompt_chars": input.prompt.len(),
-            "files": input.files.len(),
+            "attachments": input.attach.len(),
             "context_chars": input.context.as_ref().map(|s| s.len()),
             "model": opts.model,
             "status": envelope["status"],
@@ -244,24 +241,17 @@ fn load_schema(source: &SchemaSource) -> Result<structured::Schema, String> {
 
 // ---- context ----------------------------------------------------------------
 
-/// The ask message: each context file, then stdin, as fenced blocks, then the
-/// prompt.
+/// The ask message: stdin/`context` as a fenced block, then the prompt.
+///
+/// Files are NOT inlined here: they go as real attachments (see
+/// [`load_attachments`]), so this only carries text the caller already has.
 fn ask_message(input: &AskInput) -> Result<String> {
-    let mut files = Vec::new();
-    for path in &input.files {
-        let contents = fs::read_to_string(path)
-            .with_context(|| format!("failed to read context file: {path}"))?;
-        files.push((path.clone(), contents));
-    }
-    Ok(compose(&files, input.context.as_deref(), &input.prompt))
+    Ok(compose(input.context.as_deref(), &input.prompt))
 }
 
 /// Pure assembly of the ask message.
-fn compose(files: &[(String, String)], context: Option<&str>, prompt: &str) -> String {
+fn compose(context: Option<&str>, prompt: &str) -> String {
     let mut message = String::new();
-    for (path, contents) in files {
-        message.push_str(&format!("Context file: {path}\n{}\n\n", fenced(contents)));
-    }
     if let Some(text) = context.filter(|t| !t.trim().is_empty()) {
         message.push_str(&format!("Additional context:\n{}\n\n", fenced(text)));
     }
@@ -475,23 +465,20 @@ fn finish_receipt(path: Option<&std::path::Path>, envelope: &serde_json::Value) 
 // ---- Non-Ask delegation modes -----------------------------------------------
 
 fn run_delegation_mode(args: &AskArgs, opts: ChannelOptions, stdin: Option<&str>) -> Result<()> {
-    // Collect all --file contents (and stdin) into one compact context block.
+    // Files travel as attachments; only stdin becomes inline context here.
     let mut context = String::new();
-    for file_path in &args.files {
-        let contents = fs::read_to_string(file_path)
-            .with_context(|| format!("failed to read context file: {file_path}"))?;
-        context.push_str(&format!("### File: {file_path}\n{}\n\n", fenced(&contents)));
-    }
     if let Some(text) = stdin {
         context.push_str(&format!("### stdin\n{}\n\n", fenced(text)));
     }
+    let attachments = load_attachments(&args.attach)?;
 
     // Build the mode-typed delegation-packet prompt.
     let message = delegation::build_prompt(args.mode, &args.prompt, &context);
 
     // Connect, send, always close even on error.
     let mut channel = Channel::connect(&opts)?;
-    let reply_result = channel.send(&message);
+    let sopts = crate::channel::SendOptions { attachments, ..Default::default() };
+    let reply_result = channel.send_with(&message, &sopts);
     channel.close();
 
     let reply = reply_result?;
@@ -593,7 +580,6 @@ mod tests {
     fn input(prompt: &str) -> AskInput {
         AskInput {
             prompt: prompt.into(),
-            files: vec![],
             attach: vec![],
             context: None,
             schema: None,
@@ -617,18 +603,18 @@ mod tests {
     }
 
     #[test]
-    fn compose_puts_files_then_stdin_then_prompt() {
-        let m = compose(&[("a.rs".into(), "fn a() {}\n".into())], Some("diff --git x"), "review");
-        let (a, s, p) = (m.find("a.rs").unwrap(), m.find("diff --git").unwrap(), m.rfind("review").unwrap());
-        assert!(a < s && s < p, "{m}");
+    fn compose_puts_context_then_prompt() {
+        let m = compose(Some("diff --git x"), "review");
+        let (s, p) = (m.find("diff --git").unwrap(), m.rfind("review").unwrap());
+        assert!(s < p, "{m}");
         assert!(m.contains("Additional context:"), "{m}");
         assert!(m.ends_with("review"));
     }
 
     #[test]
     fn blank_stdin_adds_nothing() {
-        assert_eq!(compose(&[], Some("  \n"), "q"), "q");
-        assert_eq!(compose(&[], None, "q"), "q");
+        assert_eq!(compose(Some("  \n"), "q"), "q");
+        assert_eq!(compose(None, "q"), "q");
     }
 
     #[test]
@@ -759,7 +745,7 @@ mod tests {
     #[test]
     fn execute_reports_an_unreadable_file_as_one_envelope() {
         let mut i = input("q");
-        i.files = vec!["/nonexistent/cgu-ask-test".into()];
+        i.attach = vec!["/nonexistent/cgu-ask-test".into()];
         i.request_id = Some("cgu-test-unreadable".into());
         let env = execute(&i, opts());
         assert_eq!(env["status"], "failed");

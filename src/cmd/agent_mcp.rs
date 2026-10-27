@@ -402,11 +402,6 @@ impl<B: Backend> Server<B> {
         let token = new_owner_token(self.seq.fetch_add(1, Ordering::SeqCst));
         let input = AskInput {
             prompt: args["prompt"].as_str().unwrap_or_default().to_string(),
-            files: args
-                .get("files")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
-                .unwrap_or_default(),
             attach: args
                 .get("attach")
                 .and_then(Value::as_array)
@@ -641,8 +636,7 @@ fn tool_list() -> Vec<Value> {
                 "properties": {
                     "prompt": {"type": "string", "minLength": 1},
                     "context": {"type": "string", "description": "Context text sent before the prompt."},
-                    "files": {"type": "array", "items": {"type": "string"}, "description": "Paths whose contents are sent as context."},
-                    "attach": {"type": "array", "items": {"type": "string"}, "description": "Paths of files uploaded to the chat as REAL attachments through ChatGPT's own upload pipeline (PDF/image/sheet structure preserved), rather than pasted as text context."},
+                    "attach": {"type": "array", "items": {"type": "string"}, "description": "Files to send with the prompt, UPLOADED as real attachments through ChatGPT's own upload pipeline. PDF layout, spreadsheet cells and image pixels survive; non-UTF-8 binaries work at all; the bytes do not spend the prompt budget. This is the preferred way to give ChatGPT a file."},
                     "output_schema": schema,
                     "request_id": request_id,
                     "model": {"type": "string", "description": "instant | medium | high | extra high | pro, or a model name."},

@@ -200,14 +200,15 @@ pub struct ChannelArgs {
 pub struct AskArgs {
     /// The question / instruction to send to ChatGPT.
     pub prompt: String,
-    /// Files whose contents are prepended as context (repeatable).
-    #[arg(long = "file")]
-    pub files: Vec<String>,
-    /// Files UPLOADED to the chat as real attachments (repeatable).
+    /// Files to send with the message, uploaded as real attachments
+    /// (repeatable).
     ///
-    /// Unlike --file, which pastes a file's text into the message, these go
-    /// through ChatGPT's own upload pipeline: PDF layout, spreadsheet cells and
-    /// image pixels survive, and the bytes do not spend the prompt budget.
+    /// These go through ChatGPT's own upload pipeline, so PDF layout,
+    /// spreadsheet cells and image pixels all survive, binaries that are not
+    /// UTF-8 work at all, and the bytes do not spend the prompt budget the way
+    /// pasted text does. This is the ONLY way `ask` takes files: content that
+    /// must be in the prompt itself goes through stdin or the MCP `context`
+    /// argument.
     #[arg(long = "attach")]
     pub attach: Vec<String>,
     /// Delegation mode: ask (plain text) | plan | review | debug | research.

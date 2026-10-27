@@ -23,11 +23,11 @@ and a Chrome profile logged in to chatgpt.com.
 
 ```sh
 # Sidekick — one round trip, caller stays the brain
-chatgpt-use ask "<question>" [--file <path> ...] [--attach <path> ...] --no-stdin
+chatgpt-use ask "<question>" [--attach <path> ...] --no-stdin
 git diff | chatgpt-use ask "Explain what changed and what might break"
 
 # Structured delegation — plan/review/debug/research verdict packet, optionally --model pro
-chatgpt-use ask "<task>" --mode plan|review|debug|research --file <ctx> [--json] [--model pro] --no-stdin
+chatgpt-use ask "<task>" --mode plan|review|debug|research --attach <ctx> [--json] [--model pro] --no-stdin
 chatgpt-use handoff plan.json --to codex|claude-code [--execute]   # dry-run without --execute
 
 # Code review — ChatGPT explores the repo itself from the change vs --base (read-only tools, throwaway worktree)
