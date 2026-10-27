@@ -833,7 +833,17 @@ macro_rules! js_file_input_helper {
     () => {
         r#"
   const __cguFileInput = () => {
-    const inputs = [...document.querySelectorAll('input[type="file"]')].filter(n => !n.disabled);
+    // Scope to the LIVE composer's form. ChatGPT leaves the previous composer's
+    // DOM behind after each "New chat" switch, so a plain document-wide query
+    // finds 4 inputs per composer ever visited — 28 after seven switches,
+    // measured live. Handing the file to one of those stale inputs dispatches
+    // into a detached subtree: it reports success and no chip ever appears,
+    // which is exactly how attachment waits timed out while the manual drop
+    // worked.
+    const composer = __cguComposer();
+    const form = composer && composer.closest('form');
+    const scope = form || document;
+    const inputs = [...scope.querySelectorAll('input[type="file"]')].filter(n => !n.disabled);
     // ChatGPT keeps FOUR file inputs in the composer: three scoped to images
     // and video (accept="image/*" etc) and one general one. Dropping a PDF or a
     // .txt on an image input is discarded without an error, so pick the general
@@ -1446,9 +1456,16 @@ pub(crate) fn filename_stem(name: &str) -> String {
     }
 }
 
-/// Is `candidate` the stem we want, or that stem with ChatGPT's "(n)" suffix?
+/// Is `candidate` the stem we want, or that stem carrying a duplicate marker?
 ///
-/// "probe" matches "probe" and "probe(2)", but NOT "probe_extra" or "probes".
+/// ChatGPT does not overwrite a duplicate upload, it renames it — and the marker
+/// it uses varies. Seen live: "probe(2).txt" (a small integer) and
+/// "probe(20261027-095942).txt" (a timestamp, on the same account, minutes
+/// apart). So a marker is anything the UI appends inside one trailing pair of
+/// parentheses, and the check is that the remainder is *only* that marker:
+/// "probe" accepts "probe(2)" and "probe(20261027-095942)", but not
+/// "probe_extra" or "probes" — treating those as ours would send the turn with
+/// a file the caller never named.
 pub(crate) fn stem_matches(candidate: &str, want: &str) -> bool {
     if candidate == want {
         return true;
@@ -1456,11 +1473,15 @@ pub(crate) fn stem_matches(candidate: &str, want: &str) -> bool {
     let Some(rest) = candidate.strip_prefix(want) else {
         return false;
     };
-    // Only a strict "(digits)" tail counts as a duplicate marker.
     let Some(inner) = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')) else {
         return false;
     };
-    !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit())
+    // A marker, not free text: at least one char, all alphanumeric/hyphen/
+    // underscore (covers "2", "8", "20261027-095942"), never nested parens.
+    !inner.is_empty()
+        && inner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Does the tray prove `stem` is attached and settled?
@@ -4647,13 +4668,30 @@ mod tests {
     #[test]
     fn stem_matches_only_exact_or_duplicate_markers() {
         assert!(stem_matches("probe", "probe"));
-        assert!(stem_matches("probe(2)", "probe"));
-        assert!(stem_matches("probe(12)", "probe"));
+        // Both markers observed live on the same account, minutes apart.
+        assert!(stem_matches("probe(2)", "probe"), "small-integer marker");
+        assert!(
+            stem_matches("probe(20261027-095942)", "probe"),
+            "timestamp marker — this is the one that timed out for real"
+        );
+        assert!(stem_matches("probe(8)", "probe"));
         // Not a duplicate marker — a different file.
         assert!(!stem_matches("probe_extra", "probe"));
         assert!(!stem_matches("probes", "probe"));
         assert!(!stem_matches("probe()", "probe"));
-        assert!(!stem_matches("probe(x)", "probe"));
+        assert!(!stem_matches("probe(a b)", "probe"));
+        assert!(!stem_matches("probe((2))", "probe"));
         assert!(!stem_matches("other", "probe"));
+    }
+
+    #[test]
+    fn verdict_matches_a_timestamp_renamed_upload() {
+        // Verbatim from the live tray: uploading probe.txt came back as
+        // probe(20261027-095942).txt.
+        let names = vec!["probe(20261027-095942).txt".to_string()];
+        assert_eq!(
+            attachment_verdict(&names, "probe", 1, false, false),
+            AttachVerdict::Settled
+        );
     }
 }
