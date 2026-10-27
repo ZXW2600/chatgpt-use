@@ -833,24 +833,16 @@ macro_rules! js_file_input_helper {
     () => {
         r#"
   const __cguFileInput = () => {
-    const composer = __cguComposer();
-    const form = composer && composer.closest('form');
-    const inForm = form
-      ? [...form.querySelectorAll('input[type="file"]')].filter(n => !n.disabled)
-      : [];
-    if (inForm.length) return inForm[inForm.length - 1];
-    const loose = [...document.querySelectorAll('input[type="file"]')]
-      .filter(n => !n.disabled && !n.closest('[data-turn-key], [data-message-author-role], .markdown'));
-    if (!composer) return loose[loose.length - 1] || null;
-    let best = null, bestDist = Infinity;
-    for (const n of loose) {
-      const d = n.compareDocumentPosition(composer);
-      // Prefer nodes AFTER the composer in document order (the tray sits below it).
-      const after = (d & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
-      const dist = after ? 0 : 1;
-      if (dist < bestDist) { best = n; bestDist = dist; }
-    }
-    return best;
+    const inputs = [...document.querySelectorAll('input[type="file"]')].filter(n => !n.disabled);
+    // ChatGPT keeps FOUR file inputs in the composer: three scoped to images
+    // and video (accept="image/*" etc) and one general one. Dropping a PDF or a
+    // .txt on an image input is discarded without an error, so pick the general
+    // one explicitly — by its aria-label when present, else by empty `accept`.
+    const general = inputs.find(n => {
+      const label = n.getAttribute('aria-label') || '';
+      return /attach file|add file|附加文件|添加文件/i.test(label);
+    }) || inputs.find(n => (n.getAttribute('accept') || '') === '');
+    return general || null;
   };
 "#
     };
@@ -886,18 +878,25 @@ fn js_attach_state() -> String {
     format!(
         r#"(() => {{{composer}
   const composer = __cguComposer();
-  // Chips live in the composer form. Scoping there keeps a PREVIOUS turn's
-  // rendered attachments in the transcript from being counted as ours.
-  const scope = (composer && composer.closest('form')) || document.querySelector('form') || document.body;
-  const chips = scope.querySelectorAll(
-    '[data-testid*="attachment" i], [data-testid*="file" i][role], img[alt][data-testid], ' +
-    'div[class*="attachment" i]'
-  );
-  const pending = !!scope.querySelector(
-    '[data-testid*="upload" i], [aria-label*="Uploading" i], [class*="uploading" i]'
-  );
-  const rejected = !!document.querySelector('[role="alert"] [class*="error" i]');
-  return JSON.stringify({{count: chips.length, pending: pending, rejected: rejected}});
+  const form = composer && composer.closest('form');
+  if (!form) return JSON.stringify({{count: 0, names: [], pending: false, rejected: false}});
+  // Scope to the composer's OWN form. A document-wide query is how a previous
+  // build counted a SIDEBAR CONVERSATION titled with the user's words as an
+  // upload in progress, which made every attach wait forever.
+  const tray = form.querySelector('[class*="ComposerLayoutAttachments"]') || form;
+  // ChatGPT renders several `composer-attachment` nodes per file (thumb, name,
+  // container — 5 for a plain .txt as of Oct 2026), so count distinct NAMES.
+  const nodes = [...tray.querySelectorAll('[class*="composer-attachment"]')];
+  const names = new Set();
+  for (const n of nodes) {{
+    const t = (n.textContent || '').trim();
+    if (t && t.length < 200) names.add(t.replace(/\s+/g, ' '));
+  }}
+  // Settled = no progress ring and no spinner INSIDE the attachment tray.
+  const pending =
+    !!tray.querySelector('[role="progressbar"], [class*="animate-spin"], [class*="animate-pulse"]');
+  const rejected = !!form.querySelector('[role="alert"]');
+  return JSON.stringify({{count: names.size, names: [...names].slice(0, 20), pending: pending, rejected: rejected}});
 }})()"#,
         composer = js_composer_helper!()
     )
@@ -1419,6 +1418,76 @@ impl SendOptions {
     }
 }
 
+/// What one poll of the attachment tray says about the file we are waiting on.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AttachVerdict {
+    /// The file's chip is present and nothing is still spinning.
+    Settled,
+    /// ChatGPT refused it (type or size); waiting will never help.
+    Rejected,
+    /// Not there yet, or still uploading.
+    Waiting,
+}
+
+/// `name` without its extension — what survives ChatGPT's duplicate renaming.
+///
+/// "probe.txt" → "probe", so "probe(2).txt" still matches. Kept byte-exact
+/// rather than case-folded: file names are case-sensitive on Linux, and a
+/// false positive here means sending a turn WITHOUT its attachment.
+pub(crate) fn filename_stem(name: &str) -> String {
+    match name.rfind('.') {
+        Some(i) if i > 0 => name[..i].to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// Is `candidate` the stem we want, or that stem with ChatGPT's "(n)" suffix?
+///
+/// "probe" matches "probe" and "probe(2)", but NOT "probe_extra" or "probes".
+pub(crate) fn stem_matches(candidate: &str, want: &str) -> bool {
+    if candidate == want {
+        return true;
+    }
+    let Some(rest) = candidate.strip_prefix(want) else {
+        return false;
+    };
+    // Only a strict "(digits)" tail counts as a duplicate marker.
+    let Some(inner) = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')) else {
+        return false;
+    };
+    !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Does the tray prove `stem` is attached and settled?
+///
+/// Everyone of these is a pure decision over what the page reported, so the
+/// tricky part (renamed duplicates, leftovers from a previous turn, a file that
+/// is present but still uploading) is testable without a browser.
+pub(crate) fn attachment_verdict(
+    names: &[String],
+    stem: &str,
+    at_least: usize,
+    pending: bool,
+    rejected: bool,
+) -> AttachVerdict {
+    if rejected {
+        return AttachVerdict::Rejected;
+    }
+    // ChatGPT renames a duplicate upload rather than overwriting: our
+    // "probe.txt" came back as "probe(2).txt", then "probe(3).txt", and so on.
+    // So a name matches when its stem IS the stem we are waiting for, or when it
+    // is that stem followed by a ChatGPT duplicate marker "(n)". An exact match
+    // only would time out on every re-upload; a `contains` would accept
+    // "probe_extra" for "probe", which is worse — it sends the turn with the
+    // wrong attachment.
+    let present = names.iter().any(|n| stem_matches(filename_stem(n.trim()).as_str(), stem));
+    if present && names.len() >= at_least && !pending {
+        AttachVerdict::Settled
+    } else {
+        AttachVerdict::Waiting
+    }
+}
+
 /// A live conversation. `send` keeps appending turns to the SAME chat, so
 /// ChatGPT retains context across calls — the multi-turn loops (run/serve) only
 /// send the new turn, not the whole history.
@@ -1730,7 +1799,7 @@ impl Channel {
         attachments: &[Attachment],
     ) -> std::result::Result<(), SubmitFailure> {
         self.attach_files(attachments, budget)
-            .map_err(SubmitFailure::BeforeSubmit)?;
+            .map_err(SubmitFailure::AttachmentFailed)?;
         self.fill_composer(message, budget)
             .map_err(SubmitFailure::BeforeSubmit)?;
         self.submit(baseline_users, budget)
@@ -1998,27 +2067,34 @@ impl Channel {
     /// turn we cannot send is worse than failing.
     fn wait_attachment_settled(&self, filename: &str, at_least: usize, budget: f64) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs_f64(budget.min(120.0));
+        // ChatGPT renames a duplicate upload ("probe.txt" → "probe(2).txt"), so
+        // match on the stem rather than the whole name.
+        let stem = filename_stem(filename);
         loop {
             let state = ab_eval(&self.ab, &js_attach_state(), &self.session, budget)
                 .ok()
                 .filter(|v| v.is_object())
                 .unwrap_or_default();
-            let chips = state.get("count").and_then(|c| c.as_u64()).unwrap_or(0) as usize;
+            let names: Vec<String> = state
+                .get("names")
+                .and_then(|n| n.as_array())
+                .map(|a| a.iter().filter_map(|n| n.as_str()).map(str::to_string).collect())
+                .unwrap_or_default();
             let pending = state.get("pending").and_then(|p| p.as_bool()).unwrap_or(false);
             let rejected = state.get("rejected").and_then(|r| r.as_bool()).unwrap_or(false);
-            if rejected {
-                bail!(
+            let settled = attachment_verdict(&names, &stem, at_least, pending, rejected);
+            match settled {
+                AttachVerdict::Settled => return Ok(()),
+                AttachVerdict::Rejected => bail!(
                     "{filename:?} was rejected by ChatGPT (unsupported type, or over the size \
                      limit) — it will not be attached"
-                );
-            }
-            if chips >= at_least && !pending {
-                return Ok(());
+                ),
+                AttachVerdict::Waiting => {}
             }
             if Instant::now() >= deadline {
                 bail!(
-                    "timed out waiting for {filename:?} to upload ({chips} attached, \
-                     pending={pending})"
+                    "timed out waiting for {filename:?} to upload ({} distinct name(s) in the                      tray: {names:?}, pending={pending})",
+                    names.len()
                 );
             }
             std::thread::sleep(Duration::from_millis(400));
@@ -2521,6 +2597,8 @@ impl Channel {
         {
             // Fail closed on anything that might already be in flight.
             let SubmitFailure::BeforeSubmit(why) = first else {
+                // AttachmentFailed: nothing was sent and a reconnect would only
+                // throw away what did upload. Ambiguous: never auto-retry.
                 return Err(first.into_error());
             };
             eprintln!("submit failed: {why:#}");
@@ -3280,6 +3358,15 @@ impl Channel {
 enum SubmitFailure {
     /// Failed before anything was submitted — safe to reconnect and retry.
     BeforeSubmit(anyhow::Error),
+    /// An attachment could not be uploaded, so the message never went out.
+    ///
+    /// Deliberately its own case: reconnecting cannot fix it — a reconnect
+    /// navigates or reopens the chat, which DISCARDS every attachment already
+    /// uploaded and then uploads them again into a page that may reject them
+    /// for the same reason. Retrying there is how one bad file turned into a
+    /// burst of page loads (45 backend requests each). Fail, and let the caller
+    /// decide; nothing was submitted, so a retry is still safe later.
+    AttachmentFailed(anyhow::Error),
     /// Enter was pressed but no receipt appeared — never auto-retry.
     Ambiguous(anyhow::Error),
 }
@@ -3288,6 +3375,7 @@ impl SubmitFailure {
     fn into_error(self) -> anyhow::Error {
         match self {
             SubmitFailure::BeforeSubmit(e) => e,
+            SubmitFailure::AttachmentFailed(e) => e,
             // Whatever the proximate cause, the prompt may be on the server and
             // the caller must not resend it.
             SubmitFailure::Ambiguous(mut e) => {
@@ -4448,5 +4536,83 @@ mod tests {
         let raw = b"hello \x00\xff world";
         let enc = BASE64.encode(raw);
         assert_eq!(BASE64.decode(&enc).unwrap(), raw);
+    }
+
+    // ---- attachment verdict (pure) -----------------------------------------
+
+    #[test]
+    fn stem_survives_chatgpts_duplicate_renaming() {
+        assert_eq!(filename_stem("probe.txt"), "probe");
+        assert_eq!(filename_stem("probe(2).txt"), "probe(2)");
+        // The live case: ChatGPT renamed our upload probe.txt -> probe(8).txt.
+        // A stem match on the ORIGINAL therefore fails, which is why the match
+        // below also accepts a prefix.
+        assert_eq!(filename_stem("noext"), "noext");
+        assert_eq!(filename_stem(".hidden"), ".hidden");
+    }
+
+    #[test]
+    fn verdict_settles_when_the_name_is_present_and_nothing_spins() {
+        let names = vec!["probe.txt".to_string()];
+        assert_eq!(attachment_verdict(&names, "probe", 1, false, false), AttachVerdict::Settled);
+    }
+
+    #[test]
+    fn verdict_waits_while_an_upload_is_in_flight() {
+        let names = vec!["probe.txt".to_string()];
+        assert_eq!(attachment_verdict(&names, "probe", 1, true, false), AttachVerdict::Waiting);
+    }
+
+    #[test]
+    fn verdict_waits_when_the_name_is_absent() {
+        let names = vec!["other.txt".to_string()];
+        assert_eq!(attachment_verdict(&names, "probe", 1, false, false), AttachVerdict::Waiting);
+    }
+
+    #[test]
+    fn verdict_reports_a_rejection_even_if_the_name_shows() {
+        let names = vec!["probe.txt".to_string()];
+        assert_eq!(attachment_verdict(&names, "probe", 1, false, true), AttachVerdict::Rejected);
+    }
+
+    #[test]
+    fn verdict_does_not_accept_a_different_file_whose_stem_contains_ours() {
+        // "probe_extra" must not satisfy a wait for "probe": sending a turn with
+        // the wrong attachment is worse than failing.
+        let names = vec!["probe_extra.txt".to_string()];
+        assert_eq!(attachment_verdict(&names, "probe", 1, false, false), AttachVerdict::Waiting);
+    }
+
+    #[test]
+    fn verdict_requires_at_least_as_many_names_as_files() {
+        let names = vec!["probe.txt".to_string()];
+        // Waiting for the second of two files: one name is not enough.
+        assert_eq!(attachment_verdict(&names, "probe", 2, false, false), AttachVerdict::Waiting);
+    }
+
+    #[test]
+    fn verdict_matches_chatgpts_renamed_duplicate() {
+        // Observed live: uploading probe.txt when one was already there came
+        // back as "probe(8).txt". Waiting on the ORIGINAL stem must still pass,
+        // or every re-upload times out.
+        let names = vec!["probe(8).txt".to_string()];
+        assert_eq!(
+            attachment_verdict(&names, "probe", 1, false, false),
+            AttachVerdict::Settled,
+            "a renamed duplicate must satisfy the wait"
+        );
+    }
+
+    #[test]
+    fn stem_matches_only_exact_or_duplicate_markers() {
+        assert!(stem_matches("probe", "probe"));
+        assert!(stem_matches("probe(2)", "probe"));
+        assert!(stem_matches("probe(12)", "probe"));
+        // Not a duplicate marker — a different file.
+        assert!(!stem_matches("probe_extra", "probe"));
+        assert!(!stem_matches("probes", "probe"));
+        assert!(!stem_matches("probe()", "probe"));
+        assert!(!stem_matches("probe(x)", "probe"));
+        assert!(!stem_matches("other", "probe"));
     }
 }
