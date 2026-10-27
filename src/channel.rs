@@ -1148,10 +1148,15 @@ const JS_NEW_CHAT_IN_PLACE: &str = r#"(() => {
     return JSON.stringify({ok: false, error: 'not on chatgpt.com'});
   }
   const cands = [...document.querySelectorAll('a, button, [role="button"]')];
+  // ChatGPT's UI is localized, and this control is the one thing standing
+  // between "reuse the open tab" and "load the whole SPA again" (45 requests).
+  // Matching only the English label sent every run in a Chinese UI down the
+  // reload path.
+  const LABELS = /^(new chat|新聊天|新对话|新しいチャット|nouveau chat|neuer chat|nuevo chat|nuova chat)$/i;
   const hit = cands.find(el => {
     const al = (el.getAttribute('aria-label') || '').trim();
     const tx = (el.textContent || '').trim();
-    return /^new chat$/i.test(al) || /^new chat$/i.test(tx);
+    return LABELS.test(al) || LABELS.test(tx);
   });
   if (!hit) return JSON.stringify({ok: false, error: 'no new-chat control'});
   hit.click();
@@ -1582,7 +1587,11 @@ impl Channel {
         // SPA; the app's own "New chat" costs 1. The throttle that has been
         // biting this account counts REQUESTS, not messages, so this is the
         // difference between one run and forty-five as far as it is concerned.
-        {
+        //
+        // Order matters: check the page FIRST, click second. Clicking "New
+        // chat" on an about:blank or non-ChatGPT tab cannot work, and doing it
+        // first meant the click's own navigation was mistaken for a fresh load.
+        if self_page_is_chatgpt(&ab, &session) {
             let probe = ab_eval(&ab, JS_NEW_CHAT_IN_PLACE, &session, 15.0);
             let reused = probe
                 .as_ref()
@@ -1595,7 +1604,19 @@ impl Channel {
                 if wait_composer(&ab, &session, settle, 20).unwrap_or(false) {
                     eprintln!("reusing the open ChatGPT tab (new chat, no page reload)");
                     opened = true;
+                } else {
+                    eprintln!(
+                        "the open tab is on chatgpt.com but shows no composer;                          it needs a real load"
+                    );
                 }
+            } else {
+                let why = probe
+                    .as_ref()
+                    .ok()
+                    .and_then(|v| v.get("error"))
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("the new-chat control did not respond");
+                eprintln!("cannot reuse the open tab ({why}); loading ChatGPT");
             }
         }
 
@@ -3896,6 +3917,26 @@ fn ab_open(
 /// Close the session's tab — best effort, never raises.
 fn ab_close(ab: &PathBuf, session: &str) {
     let _ = ab_cmd(ab, &["close"], session, 15.0);
+}
+
+/// Is the session's current tab a loaded ChatGPT page (composer present)?
+///
+/// Cheap and read-only: no click, no navigation. Used to decide whether the
+/// tab is worth reusing before touching it.
+fn self_page_is_chatgpt(ab: &PathBuf, session: &str) -> bool {
+    const JS: &str = r#"(() => {
+  const onSite = /(^|\.)chatgpt\.com$/.test(location.hostname);
+  const composer = !!document.querySelector(
+    '#prompt-textarea, [contenteditable="true"][data-lexical-editor="true"], div.ProseMirror[contenteditable="true"]'
+  );
+  return JSON.stringify({onSite: onSite, composer: composer, ready: document.readyState});
+})()"#;
+    let Ok(v) = ab_eval(ab, JS, session, 10.0) else {
+        return false;
+    };
+    let on_site = v.get("onSite").and_then(|b| b.as_bool()).unwrap_or(false);
+    let composer = v.get("composer").and_then(|b| b.as_bool()).unwrap_or(false);
+    on_site && composer
 }
 
 /// Open a new chat tab and wait for the composer. Returns Ok(true) if ready.
