@@ -177,8 +177,12 @@ pub struct ChannelArgs {
     /// every run reuses ONE ChatGPT window; override only to get a separate tab.
     #[arg(long)]
     pub session: Option<String>,
-    /// File the conversation under a ChatGPT Project (empty = plain chat).
-    #[arg(long, default_value = "chatgpt-use")]
+    /// File the conversation under a ChatGPT Project.
+    ///
+    /// Empty by default: a plain chat. Grouping every question into a Project
+    /// silently creates one in the user's account the first time it runs, which
+    /// this tool has no business doing unasked.
+    #[arg(long, default_value = "")]
     pub project: String,
     /// Total wall-clock budget per model turn, in seconds.
     #[arg(long, default_value_t = 300)]
